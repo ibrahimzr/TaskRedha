@@ -1,0 +1,57 @@
+from fastapi import APIRouter,Depends,HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlmodel import Session,select
+from app.database import get_session
+from app.dependencies import get_current_user
+from app.dtos.requests import UserCreateRequest
+from app.dtos.responses import ChallengeResponse,TokenResponse,UserResponse
+from app.enums import Role
+from app.models import User
+from app.security import DUMMY_HASH,create_access_token,create_number_challenge,hash_password,verify_number_challenge,verify_password
+
+router=APIRouter(prefix="/auth",tags=["auth"])
+
+@router.post("/register",response_model=UserResponse,status_code=201)
+def register(new_user:UserCreateRequest,session:Session=Depends(get_session)):
+    if session.exec(select(User).where(User.username==new_user.username)).first():
+        raise HTTPException(status_code=409,detail="Username is already taken")
+    if session.exec(select(User).where(User.email==new_user.email)).first():
+        raise HTTPException(status_code=409,detail="Email is already registered")
+    user=User(
+        username=new_user.username,
+        email=str(new_user.email),
+        hashed_password=hash_password(new_user.password),
+        role=Role.customer,
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+@router.get("/challenge",response_model=ChallengeResponse)
+def get_challenge():
+    numbers,token=create_number_challenge()
+    return ChallengeResponse(challenge_token=token,numbers=numbers)
+
+@router.post("/login",response_model=TokenResponse)
+def login(challenge_token:str,challenge_answer:str,form:OAuth2PasswordRequestForm=Depends(),session:Session=Depends(get_session)):
+    if not verify_number_challenge(challenge_token,challenge_answer):
+        raise HTTPException(status_code=400,detail="Number challenge is incorrect or expired")
+    wrong=HTTPException(
+        status_code=401,
+        detail="Incorrect username or password",
+        headers={"WWW-Authenticate":"Bearer"},
+    )
+    user=session.exec(select(User).where(User.username==form.username.lower())).first()
+    if user is None:
+        verify_password(form.password,DUMMY_HASH)
+        raise wrong
+    if not verify_password(form.password,user.hashed_password):
+        raise wrong
+    if not user.is_active:
+        raise HTTPException(status_code=403,detail="Account is disabled")
+    return TokenResponse(access_token=create_access_token(user.id))
+
+@router.get("/me",response_model=UserResponse)
+def read_me(current_user:User=Depends(get_current_user)):
+    return current_user
